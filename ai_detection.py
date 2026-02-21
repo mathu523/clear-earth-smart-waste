@@ -7,30 +7,31 @@ from datetime import datetime
 import os
 import smtplib
 from email.message import EmailMessage
+from twilio.rest import Client
 
 ALERT_FILE = "alerts.csv"
 MAX_CAPACITY = 20.0
 FULL_THRESHOLD = 80
 
-# ===============================
+# =====================================================
 # EMAIL FUNCTION
-# ===============================
-def send_waste_alert(bin_id, location, fill_percent):
+# =====================================================
+def send_email_alert(bin_id, location, fill_percent):
     try:
         SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
         SENDER_PASSWORD = st.secrets["SENDER_PASSWORD"]
         RECEIVER_EMAIL = st.secrets["RECEIVER_EMAIL"]
     except:
-        st.error("Check secrets.toml file.")
+        st.error("Check email secrets in secrets.toml")
         return False
 
     subject = f"🚨 ALERT: Bin {bin_id} is FULL ({fill_percent}%)"
     body = f"""
-    Bin ID: {bin_id}
-    Location: {location}
-    Fill Level: {fill_percent}%
-    Time: {datetime.now()}
-    """
+Bin ID: {bin_id}
+Location: {location}
+Fill Level: {fill_percent}%
+Time: {datetime.now()}
+"""
 
     try:
         msg = EmailMessage()
@@ -42,14 +43,44 @@ def send_waste_alert(bin_id, location, fill_percent):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(SENDER_EMAIL, SENDER_PASSWORD)
             smtp.send_message(msg)
+
         return True
     except Exception as e:
         st.error(f"Email Error: {e}")
         return False
 
-# ===============================
-# PAGE UI
-# ===============================
+
+# =====================================================
+# SMS FUNCTION (Twilio)
+# =====================================================
+def send_sms_alert(bin_id, location, fill_percent):
+    try:
+        account_sid = st.secrets["TWILIO_SID"]
+        auth_token = st.secrets["TWILIO_AUTH_TOKEN"]
+        twilio_number = st.secrets["TWILIO_NUMBER"]
+        receiver_number = st.secrets["RECEIVER_NUMBER"]
+    except:
+        st.error("Check Twilio secrets in secrets.toml")
+        return False
+
+    message_body = f"🚨 ALERT! Bin {bin_id} at {location} is FULL ({fill_percent}%). Immediate pickup required."
+
+    try:
+        client = Client(account_sid, auth_token)
+        client.messages.create(
+            body=message_body,
+            from_=twilio_number,
+            to=receiver_number
+        )
+        return True
+    except Exception as e:
+        st.error(f"SMS Error: {e}")
+        return False
+
+
+# =====================================================
+# MAIN PAGE UI
+# =====================================================
 def show():
 
     st.markdown("""
@@ -61,14 +92,6 @@ def show():
         background-attachment: fixed;
         color: white;
     }
-
-    # .glass {
-    #     background: rgba(255,255,255,0.08);
-    #     backdrop-filter: blur(12px);
-    #     padding: 30px;
-    #     border-radius: 20px;
-    #     box-shadow: 0 10px 35px rgba(0,0,0,0.6);
-    # }
 
     .status-full {
         color: white;
@@ -99,27 +122,25 @@ def show():
 
     st.markdown("<h1 style='color:#8E2DE2;'>🤖 Smart Bin AI Detection</h1>", unsafe_allow_html=True)
 
+    # Create CSV if not exists
     if not os.path.exists(ALERT_FILE):
         pd.DataFrame(columns=[
             "Time", "Bin ID", "Location", "Latitude", "Longitude",
             "Weight (kg)", "Fill %", "Image Status", "Final Status"
         ]).to_csv(ALERT_FILE, index=False)
 
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown('<div class="glass">', unsafe_allow_html=True)
         bin_id = st.text_input("Bin ID", "BIN_NY_01")
         location = st.text_input("Location", "Central Park")
         weight = st.slider("Weight (kg)", 0.0, 30.0, 5.0)
         lat, lon = 40.7850, -73.9682
-        st.markdown('</div>', unsafe_allow_html=True)
 
     with col2:
-        st.markdown('<div class="glass">', unsafe_allow_html=True)
         cam = st.camera_input("📸 Scan Bin Contents")
-        st.markdown('</div>', unsafe_allow_html=True)
 
+    # Detection Logic
     fill_pct = min((weight / MAX_CAPACITY) * 100, 100)
     img_status = "NOT PROVIDED"
 
@@ -131,12 +152,11 @@ def show():
         density = np.count_nonzero(edges) / edges.size
         img_status = "FULL" if density > 0.07 else "NOT FULL"
 
-    w_status = "FULL" if fill_pct >= FULL_THRESHOLD else "NOT FULL"
-    final_status = "FULL" if (w_status == "FULL" or img_status == "FULL") else "NOT FULL"
+    weight_status = "FULL" if fill_pct >= FULL_THRESHOLD else "NOT FULL"
+    final_status = "FULL" if (weight_status == "FULL" or img_status == "FULL") else "NOT FULL"
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # STATUS DISPLAY
     if final_status == "FULL":
         st.markdown('<div class="status-full">🚨 BIN FULL - ACTION REQUIRED</div>', unsafe_allow_html=True)
     else:
@@ -144,6 +164,9 @@ def show():
 
     st.progress(int(fill_pct))
 
+    # =====================================================
+    # PROCESS BUTTON
+    # =====================================================
     if st.button("🚀 Process & Notify", use_container_width=True):
 
         df = pd.read_csv(ALERT_FILE)
@@ -160,11 +183,18 @@ def show():
             "Final Status": final_status
         }])
 
-        pd.concat([df, new_data], ignore_index=True)\
-          .to_csv(ALERT_FILE, index=False)
+        df = pd.concat([df, new_data], ignore_index=True)
+        df.to_csv(ALERT_FILE, index=False)
 
         if final_status == "FULL":
-            if send_waste_alert(bin_id, location, round(fill_pct,1)):
-                st.success("Authorities notified successfully!")
+
+            email_sent = send_email_alert(bin_id, location, round(fill_pct,1))
+            sms_sent = send_sms_alert(bin_id, location, round(fill_pct,1))
+
+            if email_sent and sms_sent:
+                st.success("Authorities notified via Email & SMS successfully!")
+            else:
+                st.warning("Alert triggered but check email/SMS configuration.")
+
         else:
             st.success("Log saved successfully!")
